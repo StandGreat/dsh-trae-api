@@ -16,6 +16,7 @@ const auth = require('./auth');
 const traeClient = require('./trae-client');
 const { handleOpenAIResponse } = require('./openai-format');
 const { handleAnthropicResponse, estimateTokens } = require('./anthropic-format');
+const { anthropicMessages, openaiMessages } = require('./native-tools');
 
 const DEFAULT_BASE_URLS = {
   cn: 'https://trae-api-cn.mchost.guru',
@@ -116,166 +117,12 @@ function toolsToSystemPrompt(tools) {
   return lines.join('\n');
 }
 
-function convertAnthropicMessages(messages, systemPrompt, tools) {
-  const systemParts = [];
-
-  if (systemPrompt) {
-    const sysContent = typeof systemPrompt === 'string' ? systemPrompt :
-      Array.isArray(systemPrompt) ? extractTextFromBlocks(systemPrompt) : '';
-    const cleaned = cleanContent(sysContent);
-    if (cleaned) systemParts.push(cleaned);
-  }
-
-  const toolPrompt = toolsToSystemPrompt(tools);
-  if (toolPrompt) systemParts.push(toolPrompt);
-
-  for (const m of messages) {
-    if (m.role === 'system') {
-      const text = typeof m.content === 'string' ? m.content :
-        Array.isArray(m.content) ? extractTextFromBlocks(m.content) : '';
-      const cleaned = cleanContent(text);
-      if (cleaned) systemParts.push(cleaned);
-    }
-  }
-
-  const result = [];
-  if (systemParts.length > 0) {
-    result.push({ role: 'system', content: systemParts.join('\n\n') });
-  }
-
-  let i = 0;
-  while (i < messages.length) {
-    const m = messages[i];
-    if (m.role === 'system') { i++; continue; }
-
-    if (typeof m.content === 'string') {
-      const cleaned = cleanContent(m.content);
-      if (cleaned) result.push({ role: m.role, content: cleaned });
-      i++; continue;
-    }
-
-    if (!Array.isArray(m.content)) { i++; continue; }
-
-    if (m.role === 'assistant') {
-      const textPart = extractTextFromBlocks(m.content);
-      const toolUses = m.content.filter(b => b.type === 'tool_use');
-
-      if (toolUses.length === 0) {
-        if (textPart.trim()) result.push({ role: 'assistant', content: textPart });
-        i++; continue;
-      }
-
-      let combinedText = textPart || '';
-
-      if (i + 1 < messages.length && messages[i + 1].role === 'user') {
-        const nextBlocks = Array.isArray(messages[i + 1].content) ? messages[i + 1].content : [];
-        const toolResults = nextBlocks.filter(b => b.type === 'tool_result');
-        const nextText = extractTextFromBlocks(nextBlocks);
-
-        if (toolResults.length > 0) {
-          const toolLines = toolUses.map(tu => {
-            const inputStr = typeof tu.input === 'object' ? JSON.stringify(tu.input, null, 2) : String(tu.input);
-            return `[Called tool: ${tu.name}]\n${inputStr}`;
-          });
-          const resultLines = toolResults.map(tr => {
-            const prefix = tr.is_error ? '[Tool Error]' : '[Tool Result]';
-            return `${prefix}\n${extractToolResultText(tr)}`;
-          });
-
-          const parts = [];
-          if (combinedText.trim()) parts.push(combinedText);
-          parts.push(toolLines.join('\n\n'));
-          parts.push(resultLines.join('\n\n'));
-          result.push({ role: 'assistant', content: parts.join('\n\n') });
-
-          const cleanedNext = cleanContent(nextText);
-          if (cleanedNext) result.push({ role: 'user', content: cleanedNext });
-
-          i += 2; continue;
-        }
-      }
-
-      const toolLines = toolUses.map(tu => {
-        const inputStr = typeof tu.input === 'object' ? JSON.stringify(tu.input, null, 2) : String(tu.input);
-        return `[Called tool: ${tu.name}]\n${inputStr}`;
-      });
-      if (combinedText.trim()) combinedText += '\n\n';
-      combinedText += toolLines.join('\n\n');
-      if (combinedText.trim()) result.push({ role: 'assistant', content: combinedText });
-      i++;
-
-    } else if (m.role === 'user') {
-      const textPart = extractTextFromBlocks(m.content);
-      const toolResults = m.content.filter(b => b.type === 'tool_result');
-      const cleanedText = cleanContent(textPart);
-
-      if (cleanedText) {
-        result.push({ role: 'user', content: cleanedText });
-      } else if (toolResults.length > 0) {
-        const resultText = toolResults.map(tr => {
-          const prefix = tr.is_error ? '[Tool Error]' : '[Tool Result]';
-          return `${prefix}\n${extractToolResultText(tr)}`;
-        }).join('\n\n');
-        result.push({ role: 'user', content: resultText });
-      }
-      i++;
-    } else {
-      const textPart = extractTextFromBlocks(m.content);
-      const cleaned = cleanContent(textPart);
-      if (cleaned) result.push({ role: m.role, content: cleaned });
-      i++;
-    }
-  }
-
-  let firstSys = -1;
-  for (let j = 0; j < result.length; j++) {
-    if (result[j] && result[j].role === 'system') {
-      if (firstSys === -1) { firstSys = j; }
-      else { result[firstSys].content += '\n\n' + result[j].content; result[j] = null; }
-    }
-  }
-
-  return result.filter(Boolean);
+function convertAnthropicMessages(messages, systemPrompt) {
+  return anthropicMessages(messages, systemPrompt);
 }
 
-function convertOpenAIMessages(messages, tools) {
-  const systemParts = [];
-
-  const toolPrompt = toolsToSystemPrompt(tools);
-  if (toolPrompt) systemParts.push(toolPrompt);
-
-  for (const m of messages) {
-    if (m.role === 'system') {
-      const text = typeof m.content === 'string' ? m.content :
-        Array.isArray(m.content) ? m.content.map(c => c.text || c.content || '').join('\n') : '';
-      const cleaned = cleanContent(text);
-      if (cleaned) systemParts.push(cleaned);
-    }
-  }
-
-  const result = [];
-  if (systemParts.length > 0) {
-    result.push({ role: 'system', content: systemParts.join('\n\n') });
-  }
-
-  for (const m of messages) {
-    if (m.role === 'system') continue;
-    let content = '';
-    if (typeof m.content === 'string') content = m.content;
-    else if (Array.isArray(m.content)) content = m.content.map(c => c.text || c.content || '').join('\n');
-    const cleaned = cleanContent(content);
-    if (cleaned) result.push({ role: m.role, content: cleaned });
-  }
-
-  let firstSys = -1;
-  for (let j = 0; j < result.length; j++) {
-    if (result[j] && result[j].role === 'system') {
-      if (firstSys === -1) { firstSys = j; }
-      else { result[firstSys].content += '\n\n' + result[j].content; result[j] = null; }
-    }
-  }
-
-  return result.filter(Boolean);
+function convertOpenAIMessages(messages) {
+  return openaiMessages(messages);
 }
 
 function estimateInputTokens(system, messages, tools) {
@@ -477,7 +324,7 @@ function startServer(options = {}) {
   const app = express();
   app.use(express.json({ limit: '10mb' }));
 
-  const PORT = parseInt(options.port || process.env.PORT || '9220', 10);
+  const PORT = parseInt(options.port ?? process.env.PORT ?? '9220', 10);
   const HOST = process.env.HOST || '127.0.0.1';
   const rawApiKey = options.apiKey !== undefined ? options.apiKey : (process.env.API_KEY ?? '');
   const API_KEY = rawApiKey === '' ? 'trae-local-api' : rawApiKey;
@@ -534,7 +381,7 @@ function startServer(options = {}) {
   });
 
   app.post('/v1/chat/completions', requireAuth, async (req, res) => {
-    const { messages, model = 'auto', stream = false, tools, max_tokens } = req.body;
+    const { messages, model = 'auto', stream = false, tools, max_tokens, tool_choice } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
       return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
@@ -547,7 +394,7 @@ function startServer(options = {}) {
 
     try {
       const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-        converted, model, stream, BASE_URL, { maxTokens: max_tokens }
+        converted, model, stream, BASE_URL, { maxTokens: max_tokens, tools, toolChoice: tool_choice }
       );
 
       if (stream) {
@@ -578,7 +425,7 @@ function startServer(options = {}) {
   });
 
   app.post('/v1/messages', requireAuth, async (req, res) => {
-    const { messages, model = 'auto', stream = false, max_tokens = 4096, system, tools } = req.body;
+    const { messages, model = 'auto', stream = false, max_tokens = 4096, system, tools, tool_choice } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
       return sendAnthropicError(res, 400, 'invalid_request_error', 'messages is required');
@@ -587,28 +434,15 @@ function startServer(options = {}) {
     const bodySize = JSON.stringify(req.body).length;
     console.log(`[server] Anthropic request: model=${model}, stream=${stream}, msgs=${messages.length}, tools=${tools?.length || 0}, body=${bodySize} bytes`);
 
-    for (let i = 0; i < messages.length; i++) {
-      const m = messages[i];
-      const types = Array.isArray(m.content) ? m.content.map(b => b.type).join('+') : typeof m.content;
-      console.log(`[server]   in[${i}] role=${m.role}, types=${types}`);
-    }
-
     const converted = convertAnthropicMessages(messages, system, tools);
 
     const totalSize = JSON.stringify(converted).length;
     console.log(`[server] Converted: ${messages.length} -> ${converted.length} messages, ${totalSize} bytes`);
-    for (let i = 0; i < converted.length; i++) {
-      const m = converted[i];
-      const len = typeof m.content === 'string' ? m.content.length : 0;
-      const preview = typeof m.content === 'string' ? m.content.substring(0, 80).replace(/\n/g, '\\n') : '';
-      console.log(`[server]   out[${i}] role=${m.role}, len=${len}, preview=${preview}`);
-    }
-
     const inputTokens = estimateInputTokens(system, messages, tools);
 
     try {
       const { response: fetchResp, model: usedModel } = await traeClient.sendChatRequest(
-        converted, model, stream, BASE_URL, { maxTokens: max_tokens }
+        converted, model, stream, BASE_URL, { maxTokens: max_tokens, tools, toolChoice: tool_choice }
       );
 
       if (stream) {

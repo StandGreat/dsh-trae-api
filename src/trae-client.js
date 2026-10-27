@@ -10,6 +10,7 @@
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const auth = require('./auth');
+const { upstreamTools, upstreamToolChoice } = require('./native-tools');
 
 const IDE_VERSION_CN = process.env.TRAE_IDE_VERSION || '3.4.6';
 const IDE_VERSION_CODE_CN = process.env.TRAE_IDE_VERSION_CODE || '20261021';
@@ -125,6 +126,8 @@ function buildChatBody(messages, model, stream, options) {
   const body = {
     messages: truncated.map(m => ({
       role: m.role,
+      ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+      ...(m.tool_calls?.length ? { tool_calls: m.tool_calls } : {}),
       content: typeof m.content === 'string'
         ? [{ type: 'text', text: m.content }]
         : m.content,
@@ -138,6 +141,9 @@ function buildChatBody(messages, model, stream, options) {
   };
 
   const maxTokens = options && options.maxTokens;
+  if (options?.tools?.length) body.tools = upstreamTools(options.tools);
+  const choice = upstreamToolChoice(options?.toolChoice);
+  if (choice !== undefined && choice !== null) body.tool_choice = choice;
   if (maxTokens && typeof maxTokens === 'number' && maxTokens > 0) {
     body.max_tokens = maxTokens;
   }

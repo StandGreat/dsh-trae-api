@@ -1,225 +1,65 @@
-/**
- * openai-format.js - Convert Trae SSE events to OpenAI-compatible format
- */
+/** Preserve native tool-call deltas and reasoning in the OpenAI surface. */
+const { randomUUID } = require('node:crypto');
+const { ToolCalls } = require('./native-tools');
+const { upstreamEvents } = require('./upstream-events');
 
-const { v4: uuidv4 } = require('uuid');
-
-async function handleOpenAIResponse(fetchResponse, model, stream) {
-  if (!stream) {
-    return await collectNonStreaming(fetchResponse, model);
-  }
-  return streamGenerator(fetchResponse, model);
+function usageOf(usage) {
+  return { prompt_tokens: usage?.prompt_tokens || 0, completion_tokens: usage?.completion_tokens || 0, total_tokens: usage?.total_tokens || 0 };
 }
 
-async function collectNonStreaming(fetchResponse, model) {
-  const text = await fetchResponse.text();
-  const upstreamError = /event:\s*error\r?\n(?:data:\s*)([^\r\n]+)/.exec(text);
-  if (upstreamError) {
-    const detail = JSON.parse(upstreamError[1]);
-    throw new Error(`Trae upstream error ${detail.code}: ${detail.message}`);
-  }
-  const events = parseSSE(text);
-
-  let fullContent = '';
-  let finishReason = 'stop';
-  let reasoningContent = '';
-
-  for (const { event, data } of events) {
-    if (event === 'output') {
-      const parsed = safeJSON(data);
-      if (parsed) {
-        if (parsed.reasoning_content) {
-          reasoningContent += parsed.reasoning_content;
-        }
-        if (parsed.response) {
-          fullContent += parsed.response;
-        }
-        if (parsed.finish_reason) {
-          finishReason = parsed.finish_reason;
-        }
-      }
-    } else if (event === 'done') {
-      const parsed = safeJSON(data);
-      if (parsed && parsed.finish_reason) {
-        finishReason = parsed.finish_reason;
-      }
+async function handleOpenAIResponse(response, model, stream) {
+  if (stream) return streamGenerator(response, model);
+  const calls = new ToolCalls();
+  let text = '', reasoning = '', finish = null, usage;
+  for await (const packet of upstreamEvents(response)) {
+    if (packet.event === 'output') {
+      text += packet.data.response || ''; reasoning += packet.data.reasoning_content || '';
+      calls.add(packet.data.tool_calls);
     }
+    if (packet.event === 'token_usage') usage = packet.data;
+    if (packet.event === 'done') finish = packet.data.finish_reason || 'stop';
   }
-
-  let content = '';
-  if (reasoningContent) {
-    content += `<think>\n${reasoningContent}\n</think>\n\n`;
-  }
-  content += fullContent;
-
+  if (!finish) throw new Error('Trae stream ended without a completion event');
+  const tools = calls.values();
   return {
-    id: `chatcmpl-${uuidv4()}`,
-    object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000),
-    model: model,
-    choices: [{
-      index: 0,
-      message: { role: 'assistant', content },
-      finish_reason: finishReason,
-    }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    id: 'chatcmpl-' + randomUUID(), object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
+    choices: [{ index: 0, message: {
+      role: 'assistant', content: text || (tools.length ? null : ''),
+      ...(reasoning ? { reasoning_content: reasoning } : {}),
+      ...(tools.length ? { tool_calls: tools.map(call => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.arguments || '{}' } })) } : {}),
+    }, finish_reason: tools.length ? 'tool_calls' : finish }],
+    usage: usageOf(usage),
   };
 }
 
-async function* streamGenerator(fetchResponse, model) {
-  const reader = fetchResponse.body.getReader();
-  let currentEvent = null;
-  const decoder = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
-  let buffer = '';
-  let thinkStarted = false;
-  let thinkEnded = false;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      if (trimmed.startsWith('event:')) {
-        currentEvent = trimmed.substring(6).trim();
-        continue;
-      }
-
-      if (trimmed.startsWith('data:') && currentEvent) {
-        const data = trimmed.substring(5).trim();
-        const chunks = processSSEEvent(currentEvent, data, model, {
-          thinkStarted, thinkEnded,
-        });
-
-        for (const chunk of chunks) {
-          if (chunk._thinkState) {
-            thinkStarted = chunk._thinkState.started;
-            thinkEnded = chunk._thinkState.ended;
-            delete chunk._thinkState;
-          }
-          yield `data: ${JSON.stringify(chunk)}\n\n`;
-        }
-
-        if (currentEvent === 'done') {
-          yield 'data: [DONE]\n\n';
-          return;
-        }
-
-        currentEvent = null;
-      }
+async function* streamGenerator(response, model) {
+  const id = 'chatcmpl-' + randomUUID(), created = Math.floor(Date.now() / 1000);
+  const calls = new ToolCalls();
+  const emit = (delta, finish = null, usage) => 'data: ' + JSON.stringify({ id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta, finish_reason: finish }], ...(usage ? { usage: usageOf(usage) } : {}) }) + '\n\n';
+  let finish = null, usage;
+  yield emit({ role: 'assistant' });
+  for await (const packet of upstreamEvents(response)) {
+    if (packet.event === 'output') {
+      calls.add(packet.data.tool_calls);
+      const delta = {};
+      if (packet.data.response) delta.content = packet.data.response;
+      if (packet.data.reasoning_content) delta.reasoning_content = packet.data.reasoning_content;
+      if (packet.data.tool_calls?.length) delta.tool_calls = packet.data.tool_calls.map((call, index) => {
+        const fn = call.function_call || call.function || {};
+        const args = fn.partial_arguments ?? fn.arguments;
+        return { index: call.index ?? index, ...(call.id ? { id: call.id, type: 'function' } : {}), function: {
+          ...(fn.name ? { name: fn.name } : {}), ...(args != null ? { arguments: typeof args === 'string' ? args : JSON.stringify(args) } : {}),
+        } };
+      });
+      if (Object.keys(delta).length) yield emit(delta);
     }
+    if (packet.event === 'token_usage') usage = packet.data;
+    if (packet.event === 'done') finish = packet.data.finish_reason || 'stop';
   }
-
+  if (!finish) throw new Error('Trae stream ended without a completion event');
+  const tools = calls.values();
+  yield emit({}, tools.length ? 'tool_calls' : finish, usage);
   yield 'data: [DONE]\n\n';
-}
-
-function processSSEEvent(event, data, model, state) {
-  const chunks = [];
-  const parsed = safeJSON(data);
-  if (event === 'error') throw new Error(`Trae upstream error ${parsed?.code}: ${parsed?.message}`);
-
-  if (event === 'request_wait_in_queue') {
-    if (parsed) {
-      const pos = parsed.position || 0;
-      chunks.push({
-        id: `chatcmpl-${uuidv4()}`,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{
-          index: 0,
-          delta: { content: `[Queued: position ${pos}]\n` },
-          finish_reason: null,
-        }],
-      });
-    }
-  } else if (event === 'output' && parsed) {
-    const response = parsed.response || '';
-    const reasoning = parsed.reasoning_content || '';
-
-    if (!response && !reasoning) return chunks;
-
-    let deltaContent = '';
-
-    if (reasoning) {
-      if (!state.thinkStarted) {
-        deltaContent = '<think>\n' + reasoning;
-        state.thinkStarted = true;
-        state.thinkEnded = false;
-      } else {
-        deltaContent = reasoning;
-      }
-    }
-
-    if (response) {
-      if (state.thinkStarted && !state.thinkEnded) {
-        deltaContent = '</think>\n\n' + response;
-        state.thinkStarted = false;
-        state.thinkEnded = true;
-      } else {
-        deltaContent = response;
-      }
-    }
-
-    chunks.push({
-      id: `chatcmpl-${uuidv4()}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        delta: { content: deltaContent },
-        finish_reason: null,
-      }],
-      _thinkState: { started: state.thinkStarted, ended: state.thinkEnded },
-    });
-  } else if (event === 'done' && parsed) {
-    chunks.push({
-      id: `chatcmpl-${uuidv4()}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        delta: {},
-        finish_reason: parsed.finish_reason || 'stop',
-      }],
-    });
-  }
-
-  return chunks;
-}
-
-function parseSSE(text) {
-  const events = [];
-  const lines = text.split('\n');
-  let currentEvent = null;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('event:')) {
-      currentEvent = trimmed.substring(6).trim();
-    } else if (trimmed.startsWith('data:') && currentEvent) {
-      events.push({
-        event: currentEvent,
-        data: trimmed.substring(5).trim(),
-      });
-      currentEvent = null;
-    }
-  }
-
-  return events;
-}
-
-function safeJSON(str) {
-  try { return JSON.parse(str); } catch { return null; }
 }
 
 module.exports = { handleOpenAIResponse };
