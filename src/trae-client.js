@@ -11,41 +11,8 @@ const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const auth = require('./auth');
 
-const IDE_VERSION_CN = '3.3.67';
-const IDE_VERSION_CODE_CN = '20260401';
-
-const MODEL_MAP = {
-  'claude-opus-4-7': 'glm-5.2',
-  'claude-opus-4-6': 'glm-5.2',
-  'claude-opus-4-5': 'glm-5.2',
-  'claude-sonnet-4-6': 'glm-5.2',
-  'claude-sonnet-4-5': 'glm-5.2',
-  'claude-sonnet-4': 'glm-5.2',
-  'claude-3.5-sonnet': 'glm-5.2',
-  'claude-3.7-sonnet': 'glm-5.2',
-  'claude-haiku-4-5': 'glm-5.1',
-  'mimo-v2.5-pro': 'glm-5.2',
-  'mimo-v2.5': 'glm-5.2',
-  'gpt-4o': 'DeepSeek-V4-Pro',
-  'gpt-4o-mini': 'DeepSeek-V4-Flash',
-  'gpt-4.1': 'DeepSeek-V4-Pro',
-  'auto': 'glm-5.2',
-};
-
-const MODEL_TIERS = {
-  T1: ['glm-5.2'],
-  T2: ['glm-5.1', 'qwen-3.7-plus', 'kimi-k2.6', 'DeepSeek-V4-Pro'],
-  T3: ['glm-5', 'qwen-3.6-plus', 'minimax-m3', 'DeepSeek-V4-Flash'],
-  T4: ['glm-4.7', 'kimi-k2', 'qwen3-coder', 'minimax-m2.7'],
-  T5: ['glm-4.6', 'minimax-m2.1'],
-};
-
-function getTier(model) {
-  for (const [tier, models] of Object.entries(MODEL_TIERS)) {
-    if (models.includes(model)) return tier;
-  }
-  return null;
-}
+const IDE_VERSION_CN = process.env.TRAE_IDE_VERSION || '3.4.6';
+const IDE_VERSION_CODE_CN = process.env.TRAE_IDE_VERSION_CODE || '20261021';
 
 function hashDeviceId(machineId) {
   return crypto.createHash('sha256').update(machineId).digest('hex').substring(0, 32);
@@ -68,6 +35,7 @@ function buildHeaders(token, userId) {
     'x-request-id': requestId,
     'x-ide-version': IDE_VERSION_CN,
     'x-ide-version-code': IDE_VERSION_CODE_CN,
+    'x-app-version-code': IDE_VERSION_CODE_CN,
     'x-device-type': 'windows',
     'x-os-version': 'Windows 10',
     'Content-Type': 'application/json',
@@ -76,8 +44,7 @@ function buildHeaders(token, userId) {
 }
 
 function mapModel(requestedModel) {
-  const mapped = MODEL_MAP[requestedModel];
-  if (mapped) return mapped;
+  if (requestedModel === 'auto') return 'glm-5.2';
   return requestedModel;
 }
 
@@ -163,8 +130,9 @@ function buildChatBody(messages, model, stream, options) {
         : m.content,
     })),
     model: model,
-    function: 'inline_chat',
-    stream: stream !== false,
+    function: 'chat_v3',
+    config_name: model,
+    stream: true,
     request_id: sessionId,
     session_id: sessionId,
   };
@@ -192,7 +160,24 @@ async function sendChatRequest(messages, model, stream, baseUrl, options) {
   }
 
   const traeModel = mapModel(model);
+  const catalog = await loadModelCatalog(baseUrl);
+  const selected = catalog.find(entry => entry.id === traeModel);
+  if (!selected) {
+    const error = new Error('Model is absent from current Trae catalog: ' + traeModel);
+    error.status = 400;
+    throw error;
+  }
   const body = buildChatBody(messages, traeModel, stream, options);
+  Object.assign(body, {
+    function: selected.wireFunction,
+    config_name: selected.id,
+    model: selected.wireModel,
+    model_name: selected.wireModel,
+    config_source: selected.configSource,
+    encrypted_model_params: selected.encryptedModelParams,
+    is_custom_model: false,
+    provider: '',
+  });
   const headers = buildHeaders(auth.getToken(), userId);
 
   const endpoints = [
@@ -242,28 +227,57 @@ async function sendChatRequest(messages, model, stream, baseUrl, options) {
   throw new Error('All endpoints failed');
 }
 
-async function getModels(baseUrl) {
-  const allModels = [];
-  for (const [tier, models] of Object.entries(MODEL_TIERS)) {
-    for (const m of models) {
-      if (!allModels.find(x => x.id === m)) {
-        allModels.push({
-          id: m,
-          object: 'model',
-          created: Math.floor(Date.now() / 1000),
-          owned_by: 'trae',
-          tier: tier,
+const catalogCache = new Map();
+const catalogPending = new Map();
+async function loadModelCatalog(baseUrl) {
+  const key = baseUrl + ':' + auth.getUserId();
+  const cached = catalogCache.get(key);
+  if (cached && Date.now() - cached.at < 5 * 60 * 1000) return cached.models;
+  if (catalogPending.has(key)) return catalogPending.get(key);
+  const pending = (async () => {
+    const models = new Map();
+    for (const wireFunction of ['chat_v3', 'solo_work_remote', 'solo_work_lite']) {
+      const response = await fetch(baseUrl + '/api/ide/v1/get_detail_param', {
+        method: 'POST', headers: buildHeaders(auth.getToken(), auth.getUserId()),
+        body: JSON.stringify({ function: wireFunction, config_names: null, need_prompt: false, poly_prompt: true }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!response.ok) throw new Error('Trae model catalog HTTP ' + response.status);
+      const payload = await response.json();
+      if (payload.code && payload.code !== 0) throw new Error('Trae model catalog business error ' + payload.code);
+      const entries = payload.config_info_list ?? payload.data?.config_info_list ?? [];
+      for (const entry of entries) {
+        const name = entry.display_config?.display_name;
+        if (entry.usage !== 'chat_completion' || entry.config_switch === false || !name || /_advisor/.test(entry.config_name)) continue;
+        const detail = entry.model_detail_list?.find(model => model.model_name?.endsWith('__dev')) ?? entry.model_detail_list?.[0];
+        const contextWindow = entry.context_window_tokens?.dev;
+        if (!detail || !contextWindow || !detail.max_tokens || models.has(entry.config_name)) continue;
+        models.set(entry.config_name, {
+          id: entry.config_name, name, contextWindow, maxTokens: detail.max_tokens,
+          wireFunction, wireModel: detail.model_name, configSource: entry.config_source ?? 1,
+          encryptedModelParams: detail.encrypted_model_params,
         });
       }
     }
-  }
-  return allModels;
+    if (!models.size) throw new Error('Trae returned no chat models for this account');
+    const result = [...models.values()];
+    catalogCache.set(key, { at: Date.now(), models: result });
+    return result;
+  })().finally(() => catalogPending.delete(key));
+  catalogPending.set(key, pending);
+  return pending;
+}
+
+async function getModels(baseUrl) {
+  const catalog = await loadModelCatalog(baseUrl);
+  return catalog.map(({id, name, contextWindow, maxTokens}) => ({
+    id, name, object: 'model', owned_by: 'trae',
+    context_window: contextWindow, max_output_tokens: maxTokens,
+  }));
 }
 
 module.exports = {
   sendChatRequest,
   getModels,
   mapModel,
-  MODEL_MAP,
-  MODEL_TIERS,
 };

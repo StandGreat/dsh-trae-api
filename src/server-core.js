@@ -38,6 +38,11 @@ function mapUpstreamStatus(status) {
 }
 
 function sendAnthropicError(res, httpStatus, errorType, message) {
+  if (res.headersSent) {
+    res.write(`event: error\ndata: ${JSON.stringify(buildAnthropicError(errorType, message))}\n\n`);
+    res.end();
+    return;
+  }
   return res.status(httpStatus).json(buildAnthropicError(errorType, message));
 }
 

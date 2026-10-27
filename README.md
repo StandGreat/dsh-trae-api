@@ -1,5 +1,39 @@
 # dsh-trae-api (Trae Local API)
 
+本仓库是 [Wang-JQ77/dsh-trae-api](https://github.com/Wang-JQ77/dsh-trae-api) 的维护分支，保留原项目历史和 MIT 许可证。原作者的 npm 包 `dsh-trae-api` 不会因为此 Fork 的提交而自动更新。
+
+## 本分支的修正
+
+- `/v1/models` 查询 Trae 在线目录，合并 `chat_v3`、`solo_work_remote`、`solo_work_lite`，按账号缓存五分钟；不再返回写死的模型清单。
+- 推理请求沿用模型所属的 function、配置名、实际模型名及加密模型参数，避免目录中有模型却无法正确调用。
+- 更新客户端版本头，可通过 `TRAE_IDE_VERSION`、`TRAE_IDE_VERSION_CODE` 覆盖。
+- 处理上游 SSE 业务错误，修复网络分块导致 event 名丢失的问题，避免将失败转换为空回复。
+- 不再打印登录令牌前缀；提供不读取本机登录态、不访问真实上游的回归测试。
+- 移除将 Claude、GPT 等名称静默映射到其他厂商模型的别名；`auto` 仍显式使用 `glm-5.2`。
+
+2026-10-24 在 Windows 的 DSH `0.2.1-rc.2` 中实测 `deepseek-v4.1-flash` 与 `glm-5.3-flash` 正常返回，另验证了 Anthropic 工具调用转换。该记录不代表全部目录模型、全部 Trae 版本和未来服务状态均已验证。在线目录也不能保证每个账号均有额度或权限。
+
+### 安装本 Fork
+
+```powershell
+dsh plugin --profile web add https://codeload.github.com/StandGreat/dsh-trae-api/tar.gz/refs/heads/master
+```
+
+安装后完整重启 DSH。已有同版本 pnpm 本地补丁时，应先备份并移除对应的 `patchedDependencies` 配置，再安装本 Fork，避免重复应用旧补丁。本文原有的 `add dsh-trae-api` 命令安装的是原作者发布的 npm 包。
+
+插件启动的是本地代理，不会自动注册 DSH 模型提供方。DSH 中可添加 Anthropic 兼容提供方，地址 `http://127.0.0.1:9220`，API Key 与代理配置一致；模型 ID 和容量信息以 `/v1/models` 为准。代理在线目录刷新与 DSH 已保存模型列表是两个步骤，新增模型仍需在 DSH 重新获取并保存。
+
+### 开发验证
+
+```powershell
+npm ci --ignore-scripts
+npm run check
+```
+
+测试仅使用虚构凭据和模拟响应，不消耗账号额度。手工实网验收需要本人授权的 Trae 账号；不要提交 `.env`、storage.json、登录令牌、个人日志或 DSH 凭据文件。程序仍会将登录缓存保存到本机 `.env`；本分支未改变这一存储机制。
+
+---
+
 将 Trae Work CN 的**积分/额度**转化为本地 OpenAI/Anthropic 兼容 API 服务，让 Claude Code、Cursor、Cline、Windsurf 等第三方 AI 编程工具直接调用 Trae 底层模型（GLM、DeepSeek、Qwen、Kimi、MiniMax 等）。
 
 本项目是一个 **DeepSeek Harness (DSH) 插件**，安装后随 `dsh` 启动自动运行代理服务；也可以独立运行。

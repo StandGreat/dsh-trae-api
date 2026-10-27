@@ -149,6 +149,11 @@ async function handleAnthropicResponse(fetchResponse, model, stream, inputTokens
 
 async function collectNonStreaming(fetchResponse, model, inputTokens) {
     const text = await fetchResponse.text();
+    const upstreamError = /event:\s*error\r?\n(?:data:\s*)([^\r\n]+)/.exec(text);
+    if (upstreamError) {
+        const detail = JSON.parse(upstreamError[1]);
+        throw new Error(`Trae upstream error ${detail.code}: ${detail.message}`);
+    }
     const lines = text.split('\n');
     let fullContent = '';
     let finishReason = 'end_turn';
@@ -208,6 +213,7 @@ async function collectNonStreaming(fetchResponse, model, inputTokens) {
 
 async function* streamGenerator(fetchResponse, model, inputTokens) {
     const reader = fetchResponse.body.getReader();
+    let currentEvent = null;
     const decoder = new TextDecoder();
     let buffer = '';
     const msgId = `msg_${uuidv4().replace(/-/g, '')}`;
@@ -315,7 +321,6 @@ async function* streamGenerator(fetchResponse, model, inputTokens) {
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
-        let currentEvent = null;
 
         for (const line of lines) {
             const trimmed = line.trim();
@@ -328,6 +333,12 @@ async function* streamGenerator(fetchResponse, model, inputTokens) {
 
             const data = trimmed.substring(5).trim();
 
+            if (currentEvent === 'error') {
+                const detail = JSON.parse(data);
+                yield `event: error\ndata: ${JSON.stringify({type:'error',error:{type:'api_error',message:`Trae upstream error ${detail.code}: ${detail.message}`}})}\n\n`;
+                await reader.cancel();
+                return;
+            }
             if (currentEvent === 'done') {
                 doneReceived = true;
                 try {

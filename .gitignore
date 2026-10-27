@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.*
+!.env.example
 __pycache__/
 server.log
 server.log.bak
@@ -7,3 +9,5 @@ server.log.bak
 output/
 .DS_Store
 Thumbs.db
+storage.json
+.credentials.yaml

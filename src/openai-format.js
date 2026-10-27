@@ -13,6 +13,11 @@ async function handleOpenAIResponse(fetchResponse, model, stream) {
 
 async function collectNonStreaming(fetchResponse, model) {
   const text = await fetchResponse.text();
+  const upstreamError = /event:\s*error\r?\n(?:data:\s*)([^\r\n]+)/.exec(text);
+  if (upstreamError) {
+    const detail = JSON.parse(upstreamError[1]);
+    throw new Error(`Trae upstream error ${detail.code}: ${detail.message}`);
+  }
   const events = parseSSE(text);
 
   let fullContent = '';
@@ -63,6 +68,7 @@ async function collectNonStreaming(fetchResponse, model) {
 
 async function* streamGenerator(fetchResponse, model) {
   const reader = fetchResponse.body.getReader();
+  let currentEvent = null;
   const decoder = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
   let buffer = '';
   let thinkStarted = false;
@@ -76,7 +82,6 @@ async function* streamGenerator(fetchResponse, model) {
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
 
-    let currentEvent = null;
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -118,6 +123,7 @@ async function* streamGenerator(fetchResponse, model) {
 function processSSEEvent(event, data, model, state) {
   const chunks = [];
   const parsed = safeJSON(data);
+  if (event === 'error') throw new Error(`Trae upstream error ${parsed?.code}: ${parsed?.message}`);
 
   if (event === 'request_wait_in_queue') {
     if (parsed) {

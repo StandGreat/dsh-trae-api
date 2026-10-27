@@ -81,7 +81,7 @@ function initAuth(edition, manualToken) {
 }
 
 function _logAuth() {
-  if (authData.token) console.log(`[auth] Token: ${authData.token.substring(0, 40)}...`);
+  if (authData.token) console.log(`[auth] Token: configured`);
   if (authData.userId) console.log(`[auth] UserID: ${authData.userId}`);
   if (authData.expiredAt) console.log(`[auth] Token expires: ${authData.expiredAt}`);
 }

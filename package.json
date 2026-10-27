@@ -16,15 +16,17 @@
     "lib",
     "src",
     "cordis.patch.yml",
-    "setup.js",
+    "setup.cjs",
     "start.bat",
     ".env.example",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "setup": "node setup.js",
-    "start": "node src/server.js"
+    "setup": "node setup.cjs",
+    "start": "node src/server.js",
+    "test": "node --test",
+    "check": "node --check src/trae-client.js && node --check src/server-core.js && node --check src/auth.js && node --check src/anthropic-format.js && node --check src/openai-format.js && node --check setup.cjs && node --test"
   },
   "dependencies": {
     "express": "^4.21.0",
@@ -40,12 +42,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Wang-JQ77/dsh-trae-api.git"
+    "url": "git+https://github.com/StandGreat/dsh-trae-api.git"
   },
   "bugs": {
-    "url": "https://github.com/Wang-JQ77/dsh-trae-api/issues"
+    "url": "https://github.com/StandGreat/dsh-trae-api/issues"
   },
-  "homepage": "https://github.com/Wang-JQ77/dsh-trae-api#readme",
+  "homepage": "https://github.com/StandGreat/dsh-trae-api#readme",
   "keywords": [
     "dsh",
     "dsh-plugin",
